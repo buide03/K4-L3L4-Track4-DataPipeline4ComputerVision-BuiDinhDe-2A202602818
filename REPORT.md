@@ -73,18 +73,37 @@ Hai test có mức độ khác nhau vì hậu quả khác nhau:
 ### Câu 4
 Dựa vào `idempotency.json`: số dòng trước và sau hai lần chạy lại, và khi ghi kiểu `append`. Vì sao Delta `overwrite` theo partition (một trip) an toàn hơn xoá rồi ghi lại, nhất là khi giữa chừng có lỗi?
 
-(trả lời ở đây)
+Theo `idempotency.json`, thí nghiệm chạy lại partition `trip-00003` (60 khung):
+- **Delta `overwrite` theo predicate `trip_id`**: trước là **1246 dòng**, dấu vân tay `6c7480dfde7e`. Sau **2 lần chạy lại** vẫn **1246 dòng**, dấu vân tay `6c7480dfde7e` (`unchanged: true`).
+- **Kiểu `append` sai**: chạy 2 lần cho cùng trip ra **120 dòng** thay vì 60, tức nhân đôi (2x). Ở quy mô cả bảng, mỗi lần retry hay backfill sẽ làm phồng dataset và làm lệch phân phối khi huấn luyện.
+
+**Vì sao overwrite theo partition an toàn hơn xoá rồi ghi**: Delta ghi các file Parquet mới trước, sau đó commit **một lần duy nhất** vào `_delta_log`. Commit đó vừa đánh dấu file cũ của trip là đã xoá, vừa thêm file mới (thay thế nguyên tử). Nếu job sập giữa chừng, commit chưa xảy ra: người đọc vẫn thấy phiên bản cũ đầy đủ, file mồ côi chỉ là rác chờ dọn. Còn "xoá rồi ghi" gồm hai thao tác riêng: nếu sập sau bước xoá, trip đó **mất dữ liệu** cho tới khi chạy lại, và người đọc đồng thời thấy bảng thiếu. Ngoài ra overwrite chỉ chạm vào partition của trip đó, nên 25 trip còn lại không bị ảnh hưởng. Nhờ vậy Airflow có thể retry đúng một task.
 
 ### Câu 5
 Khung hình **đen** và khung hình **tối** khác nhau thế nào, pipeline xử lý khác nhau ra sao, bạn có đồng ý không? Dựa vào `threshold.json`: nếu chọn ngưỡng 0, 2, 6 thì bao nhiêu khung bị coi là trùng ở mỗi drive? Bạn chọn ngưỡng nào, vì sao, và ngưỡng đó phụ thuộc vào tốc độ xe thế nào?
 
+**Đen và tối khác nhau thế nào:**
+- **Khung đen** có độ sáng trung bình (luma) < `dark_luma` = 12. Đó là khung **hỏng** (camera mất tín hiệu, lỗi encode) và không chứa thông tin nào, nên bị **loại** khỏi gold.
+- **Khung tối** có 12 ≤ luma < `dark_soft` = 40. Đó là điều kiện **thật** (đường hầm, bóng râm, đêm), nên chỉ được **gắn cờ** `is_dark` và vẫn **giữ lại**.
+
+Ở bài chạy của mình, drive A có 6 khung đen và 4 khung tối, drive B có 4 khung đen và **61 khung tối** được giữ lại. Mình đồng ý với cách xử lý này: nếu bỏ khung tối, mô hình sẽ không bao giờ thấy đường hầm hay ban đêm, và sẽ thất bại đúng ở những tình huống khó nhất. Cờ `is_dark` vẫn cho phép lọc hoặc cân bằng khi cần.
+
+Theo `threshold.json`:
+
 | dHash khác tối đa | số khung trùng, drive A | số khung trùng, drive B |
 |---|---|---|
-| 0 | | |
-| 2 | | |
-| 6 | | |
+| 0 | 61 | 8 |
+| 2 | 149 | 53 |
+| 6 | 363 | 244 |
 
-(trả lời ở đây)
+Mình chọn **ngưỡng 2**, đúng như pipeline đang dùng.
+- **Ngưỡng 0** chỉ bắt khung giống hệt từng bit, bỏ sót khung gần trùng do nhiễu nén. Drive A chỉ còn 61 khung trùng, trong khi camera đứng hình 6 giây và xe chạy chậm.
+- **Ngưỡng 6** đã loại 363/602 khung (60%) của A và 244/644 khung (38%) của B. Ở mức này, nhiều khung thật sự khác nhau (xe đang di chuyển) cũng bị loại.
+- **Ngưỡng 2** bắt được 11/12 khung đứng hình (verify module 3) mà vẫn giữ phần lớn dữ liệu.
+
+**Ngưỡng phụ thuộc vào tốc độ xe**: ở 2 khung/giây, xe càng nhanh thì hai khung liền nhau càng khác nhau. Drive A có tốc độ trung bình 38.1 km/h nên có nhiều khung trùng hơn hẳn drive B (70.6 km/h), ở mọi ngưỡng (149 so với 53 ở ngưỡng 2). Nếu đặt ngưỡng cố định cao, xe chậm (tắc đường, chờ đèn đỏ) sẽ bị loại gần hết khung. Một cách tốt hơn là cho ngưỡng phụ thuộc tốc độ, hoặc lấy mẫu theo quãng đường đi được thay vì theo thời gian.
+
+**Đồng bộ telemetry**: độ trễ trung bình giữa khung hình và telemetry là 66 ms (A) và 73 ms (B), nhờ join ASOF theo event time. Độ trễ tối đa là 2884 ms và 3112 ms, rơi đúng vào lỗ hổng cảm biến ở Bước 2. Mỗi drive có 7 khung vượt `sync_tol_ms` = 150 ms, bị gắn cờ `mat_dong_bo` và bị loại.
 
 ## Bước 4 · Gold
 
