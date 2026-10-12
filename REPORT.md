@@ -7,7 +7,7 @@
 | Họ và tên | Bùi Đình Đề |
 | MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | `2A202602818` |
 | GitHub | `buide03` |
-| Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | `<điền: trip-xxxxx>` |
+| Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | `trip-01037` (MSSV có chữ nên lấy phần số: 202602818 % 26 = 2 → `list-trips[2]`) |
 
 ## Kết quả cuối
 
@@ -166,21 +166,62 @@ Hạn chế: manifest **không** ghi commit git của mã, cũng không ghi giá
 ### Câu 9
 Mô tả chính xác điều xảy ra khi trip của bạn sập rồi chạy lại: bao nhiêu task chuyển đỏ, bao nhiêu task `upstream_failed`, bạn clear gì, dữ liệu có nhân đôi không, `dataset_version` có đổi không? Bằng chứng (ảnh, số) là gì?
 
-(trả lời ở đây)
+Trip của mình là `trip-01037` (map_index 2). Mình đặt `LAB_FAIL_ONCE=trip-01037`, trigger `day09_reset`, rồi trigger `day09_video_pipeline` (run `manual__2026-10-12T18:55:01`):
+- **1 task đỏ**: `silver_frames` map_index 2. Log `attempt=1.log` ghi `RuntimeError: simulated crash while extracting trip-01037; run it again` (ảnh `airflow_fail_log.png`).
+- **7 task `upstream_failed`**: `dbt_run_silver, dbt_test_silver, dbt_run_gold, dbt_test_gold, publish_lake, export_dataset, publish_warehouse`.
+- **25 task `silver_frames` còn lại xanh**, nên không phải xử lý lại video cho 25 trip đó.
+
+**Clear**: lần đầu mình bấm `Clear task` trên map_index 2 nhưng chọn nhầm *Upstream* và bỏ *Downstream*. Kết quả là task đỏ chạy lại thành công (`attempt=2.log`, return code 0), nhưng 4 task bronze/`trip_commands` cũng chạy lại theo, còn 7 task phía sau vẫn `upstream_failed`. Sau đó mình clear `dbt_run_silver` kèm downstream trong cùng run. 7 task này chạy lại và run chuyển **xanh 37/37** (ảnh `airflow_graph_after_clear.png`). Cách đúng là clear riêng task đỏ với *Downstream + Recursive*. Bài học: chọn nhầm option sẽ chạy lại nhiều hơn cần thiết.
+
+**Dữ liệu không nhân đôi**:
+- `silver_frames` có **1246 dòng = 1246 `frame_id` khác nhau**, đúng bằng con số trước khi có lỗi.
+- Các task bronze chạy lại báo `already present` (sha256) nên không thêm dòng.
+- `scripts/lab.sh verify` đạt **27/27**.
+- `gold/datasets/` chỉ có đúng một thư mục **`98f481913304`**, nghĩa là `dataset_version` **không đổi**.
+
+Lý do: mỗi task ghi bằng Delta overwrite theo partition `trip_id` (Câu 4), và trip bị sập chưa kịp commit gì, nên chạy lại chỉ ghi đúng partition đó.
 
 ### Câu 10
 Nâng từ 2 drive lên **500 xe mỗi ngày**: ba thành phần nào của pipeline này sẽ vỡ đầu tiên, và bạn thay bằng gì (nối với slide 12, 22, 23)?
 
-(trả lời ở đây)
+Với 500 xe/ngày (≈ 250 lần dữ liệu hiện tại, mỗi xe vài giờ video), ba chỗ vỡ đầu tiên là:
+
+1. **Decode video bằng FFmpeg trong một container Airflow** (`AIRFLOW__CORE__PARALLELISM=2`, `max_active_tis_per_dagrun=1`, 2.5 GB RAM). Hiện tại 26 trip × 1–2 giây là vừa, nhưng hàng chục nghìn trip/ngày sẽ không bao giờ xử lý kịp. **Thay bằng** một cụm worker tách riêng và co giãn được (Kubernetes/Ray/Spark với GPU decode NVDEC). Airflow chỉ điều phối, không tự chạy việc nặng. Đầu vào đi qua hàng đợi theo sự kiện (S3 event → Kafka/SQS) thay vì DAG chạy tay.
+2. **DuckDB một file `lakehouse.duckdb` + dbt chạy toàn bảng**: một tiến trình đơn, khoá file (chính lỗi `Permission denied` mình gặp ở Bước 0 cho thấy nó gắn với một máy). Mỗi lần chạy lại tính lại toàn bộ silver/gold. **Thay bằng** engine phân tán đọc Delta trực tiếp (Spark/Trino/Databricks), model dbt **incremental** theo partition ngày/xe, và catalog dùng chung (Unity/Glue/Hive).
+3. **Dynamic task mapping một task cho mỗi trip, cùng một DAG run toàn cục**: hàng chục nghìn mapped task làm nghẽn scheduler và metadata DB. `day09_reset` xoá cả lake cũng không thể dùng ở production. **Thay bằng** DAG chạy theo partition (mỗi ngày, mỗi xe), backfill theo khoảng thời gian, và gom trip thành batch.
+
+Ngoài ra, MinIO một node và Postgres warehouse (marts được ghi đè toàn bộ) cũng cần thay bằng object storage thật (S3 có lifecycle sang tầng lạnh cho video thô) và một kho dữ liệu cột (BigQuery/Snowflake/ClickHouse).
 
 ## Câu hỏi riêng của bạn trên Metabase
 
 Câu SQL bạn thêm vào dashboard và điều nó cho biết:
 
-(trả lời ở đây)
+**Câu hỏi: "Trip nào bị loại nhiều khung nhất, và vì sao?"** (thẻ *Tỷ lệ khung bị loại theo trip*)
+
+```sql
+select trip_id, drive_id, split, lighting, frames, frames - frames_kept as frames_dropped,
+       round(100.0 * (frames - frames_kept) / frames, 1) as drop_pct,
+       round(avg_speed_kmh::numeric, 1) as avg_speed_kmh
+from marts.mart_trip_summary
+order by drop_pct desc
+```
+
+Kết quả (top 5):
+
+| trip | drive | split | khung | bị loại | % loại | tốc độ TB (km/h) |
+|---|---|---|---|---|---|---|
+| trip-04622 | drive_a | train | 60 | 34 | 56.7 | 67.1 |
+| trip-03904 | drive_a | train | 22 | 11 | 50.0 | 46.1 |
+| trip-02086 | drive_a | train | 60 | 28 | 46.7 | 17.6 |
+| trip-08888 | drive_a | test | 60 | 24 | 40.0 | 6.5 |
+| trip-07774 | drive_a | test | 34 | 13 | 38.2 | 12.8 |
+
+**Diễn giải**: cả 5 trip bị loại nhiều nhất đều thuộc **drive_a**. Truy vấn thêm `silver_frames_flagged` cho thấy toàn bộ khung bị loại của 3 trip đầu là **khung trùng** (34, 11, 28), không có khung đen hay mờ nào. Hệ số tương quan giữa tốc độ trung bình và tỷ lệ loại là **−0.34**: xe càng chậm (trip-08888 chỉ 6.5 km/h) thì càng nhiều khung gần giống nhau, khớp với Câu 5. Ngoại lệ là trip-04622: tốc độ trung bình 67 km/h mà vẫn mất 57%. Mình nghi đây là đoạn camera đứng hình 6 giây của drive A, vì khung đứng hình bị bắt dưới dạng trùng, nhưng cần xem ảnh để chắc chắn. Hệ quả vận hành: trip-08888 và trip-07774 nằm ở **test** mà mất gần 40% khung, nên tập test của drive_a chỉ còn 57 khung (Bước 4). Cần theo dõi chỉ số này khi chọn split.
 
 ## Nhìn lại
 
 Điều bạn thấy bất ngờ nhất, điều gì còn chưa rõ, và một lỗi dữ liệu mà bạn nghĩ pipeline **chưa** bắt được (nếu có). Tối đa 8 dòng.
 
-(trả lời ở đây)
+- **Bất ngờ nhất**: chạy lại task bị sập không làm nhân đôi gì cả, kể cả khi mình clear nhầm *Upstream* khiến bronze chạy lại. Lý do là sha256 ở bronze và overwrite theo partition ở silver. Ngưỡng dHash chỉ 2 bit mà đã loại 149/602 khung của drive A.
+- **Chưa rõ**: MSSV của mình có chữ (`2A202602818`), nên công thức `int(MSSV) % 26` trong GUIDE không chạy được. Mình lấy phần số. Mình cũng chưa hiểu vì sao `lineage` ghi `silver.frames` ở version 27: con số này phụ thuộc vào số lần ghi, nên lần chạy lại của giảng viên có thể ra số khác dù `dataset_version` giống nhau.
+- **Lỗi pipeline chưa bắt**: (1) khung **đứng hình nhưng xe vẫn chạy** chỉ bị bắt nếu dHash gần giống, chứ không đối chiếu với telemetry (tốc độ > 0 mà ảnh không đổi). Bằng chứng: verify chỉ bắt được 11/12 khung đứng hình. (2) Không có kiểm tra **GPS nhảy** (lat/lon thay đổi bất thường giữa hai mẫu), cũng không kiểm tra heading so với hướng di chuyển. (3) `max_gap_ms` chỉ `warn`: nếu cảm biến mất tín hiệu lâu, pipeline vẫn xanh và chỉ âm thầm loại khung `sync_lost`.
