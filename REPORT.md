@@ -4,9 +4,9 @@
 
 | | |
 |---|---|
-| Họ và tên | `<điền>` |
-| MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | `<điền>` |
-| GitHub | `<điền: tên tài khoản>` |
+| Họ và tên | Bùi Đình Đệ |
+| MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | `2A202602818` |
+| GitHub | `buide03` |
 | Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | `<điền: trip-xxxxx>` |
 
 ## Kết quả cuối
@@ -21,7 +21,19 @@
 ### Câu 1
 Liệt kê **ít nhất 4 khác biệt** giữa telemetry nguồn A và nguồn B mà bạn thấy ở bronze. Vì sao pipeline giữ **mỗi nguồn một bảng bronze** và để mọi cột ở dạng chữ, thay vì gộp và ép kiểu ngay?
 
-(trả lời ở đây)
+Từ `scripts/lab.sh step 1 --reset`: bronze có `raw_telemetry_a` 3021 dòng, `raw_telemetry_b` 3234 dòng (bằng đúng số dòng CSV), 26 trip, 2 video. Khác biệt giữa A và B:
+
+1. **Tên cột**: A dùng `ts_utc, speed_mps, heading_deg, lat, lon, alt_m, acc_x, acc_y, gas, brake, steer`; B dùng `timestamp_ms, spd_kmh, hdg, latitude, longitude, altitude, ax, ay, throttle_pct, brake_pct, steering`.
+2. **Đơn vị tốc độ**: A là m/s (`1.213`), B là km/h (`55.11`).
+3. **Kiểu thời gian**: A là chuỗi ISO-8601 UTC (`2025-10-07T08:00:00.014Z`), B là epoch mili giây (`1759933801509`).
+4. **Đồng hồ lệch**: dòng đầu của B là `1759933801509` = 14:30:01.509 UTC, trong khi video B bắt đầu lúc 14:30:00. `bronze_video_files` ghi `telemetry_clock_offset_ms` = 1500 cho drive_b và 0 cho drive_a.
+5. **Thang ga/phanh**: A dùng tỷ lệ 0–1 (`gas 0.028`), B dùng phần trăm (`throttle_pct 2.0`).
+
+Mọi cột dữ liệu đều là `VARCHAR`. Ô trống được giữ nguyên, ví dụ có 30 dòng thiếu tốc độ ở mỗi nguồn. Bronze chỉ thêm các cột metadata `_source_file, _batch_id, _row_no, _ingested_at`.
+
+**Vì sao mỗi nguồn một bảng và để dạng chữ:** bronze là bản sao trung thực của nguồn. Nếu gộp hoặc ép kiểu ngay, mọi lỗi diễn giải (nhầm km/h với m/s, quên trừ 1500 ms, ép `''` thành NULL hoặc 0) sẽ bị "đóng băng" vào dữ liệu gốc. Khi đó ta không còn dữ liệu thô để sửa logic và chạy lại. Giữ nguyên dạng chữ cũng có nghĩa là dòng hỏng không làm sập quá trình nạp và không bị mất âm thầm: dòng lỗi vẫn vào được bronze để silver cách ly có lý do. Mỗi nguồn một bảng còn giúp schema của từng nhà cung cấp tự thay đổi độc lập (schema drift) mà không phá bảng của nguồn kia.
+
+Pipeline nạp mỗi drive **hai lần**. Lần hai báo `already present`, vì file được nhận diện bằng sha256 (A `636ba1a9…`, B `bfa62703…`) chứ không phải theo tên. `cli history bronze.raw_telemetry_a` chỉ có **1 commit** (version 0, WRITE, 3021 dòng), nên chạy lại không làm nhân đôi dữ liệu.
 
 ## Bước 2 · Silver telemetry
 
