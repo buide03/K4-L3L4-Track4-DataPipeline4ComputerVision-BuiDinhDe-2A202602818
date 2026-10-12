@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Họ và tên | Bùi Đình Đệ |
+| Họ và tên | Bùi Đình Đề |
 | MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | `2A202602818` |
 | GitHub | `buide03` |
 | Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | `<điền: trip-xxxxx>` |
