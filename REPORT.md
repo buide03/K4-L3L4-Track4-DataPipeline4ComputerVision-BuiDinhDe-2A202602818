@@ -40,12 +40,33 @@ Pipeline nạp mỗi drive **hai lần**. Lần hai báo `already present`, vì 
 ### Câu 2
 Pipeline đưa hai nguồn về một schema như thế nào (đơn vị, kiểu thời gian, **độ lệch đồng hồ**)? Bằng chứng nào trong kết quả bước 2 cho thấy đã đúng? Dán bảng quarantine của bạn (số dòng theo từng lý do, từng drive) và giải thích vì sao dòng lỗi vào `rejects` thay vì bị xoá.
 
-(trả lời ở đây)
+Pipeline có hai model staging, `stg_telemetry_a.sql` và `stg_telemetry_b.sql`, đưa hai nguồn về cùng các cột `ts, speed_mps, heading_deg, lat, lon, …, gas, brake, steer`:
+- **Tên cột**: các cột của B (`spd_kmh, hdg, latitude, throttle_pct…`) được đổi tên theo A.
+- **Đơn vị**: `spd_kmh / 3.6` để ra m/s; `throttle_pct, brake_pct / 100` để về thang 0–1 như A.
+- **Kiểu thời gian**: A parse chuỗi ISO; B dùng `to_timestamp(timestamp_ms / 1000)`. Cả hai ra `timestamp with time zone` UTC.
+- **Độ lệch đồng hồ**: B trừ `telemetry_clock_offset_ms` = 1500 ms, lấy từ `bronze.video_files` qua phép join theo `drive_id`. Giá trị này không bị viết cứng trong SQL.
+
+**Bằng chứng**: `bat_dau` của B là `2025-10-08 14:30:00.009`, khớp thời điểm bắt đầu video 14:30:00. Trước khi trừ, giá trị thô là 14:30:01.509. Tốc độ tối đa sau chuẩn hoá hợp lý: A 71 km/h, B 100 km/h. Verify module 2 đạt **7/7**, gồm cả kiểm tra "drive B clock offset removed".
+
+| drive_id | duplicate | speed_missing | speed_out_of_range | tổng cách ly | dòng sạch | nhận về |
+|---|---|---|---|---|---|---|
+| drive_a | 20 | 30 | 3 | 53 | 2968 | 3021 |
+| drive_b | 20 | 30 | 3 | 53 | 3181 | 3234 |
+
+`silver.telemetry` có 6149 dòng, `silver.telemetry_rejects` có 106 dòng. Hệ thức sạch + cách ly = nhận về đúng ở cả hai drive.
+
+**Vì sao vào `rejects` thay vì xoá**: giữ lại thì đếm được. Ta chứng minh được không dòng nào bị mất âm thầm (2968 + 53 = 3021), và theo dõi được tỷ lệ lỗi của từng nguồn theo thời gian. Nhà cung cấp cảm biến cũng có bằng chứng cụ thể để sửa lỗi. Nếu luật làm sạch sai, ví dụ ngưỡng 70 m/s quá chặt, ta có thể xem lại các dòng bị loại và khôi phục chúng mà không phải nạp lại từ nguồn.
 
 ### Câu 3
 Vì sao test `max_gap_ms` là `warn` còn `in_range` là `error`? Kết quả thí nghiệm `break-gate` của bạn (`break_gate.json`): test nào bắt được, bao nhiêu dòng, và điều đó cho biết gì về vai trò của "cổng chất lượng"?
 
-(trả lời ở đây)
+Hai test có mức độ khác nhau vì hậu quả khác nhau:
+- **`in_range` (0..70 m/s) là `error`**: tốc độ vô lý là dữ liệu **sai**. Nếu lọt qua, nó làm hỏng nhãn và đặc trưng của dataset huấn luyện, nên pipeline phải dừng trước khi tới gold.
+- **`max_gap_ms` (> 1000 ms) là `warn`**: một khoảng trống telemetry là hiện tượng **thật** (cảm biến mất tín hiệu). Các dòng còn lại vẫn đúng, nên chỉ cần báo động. Ở bài chạy của mình, mỗi drive có đúng 1 lỗ hổng: khoảng trống lớn nhất là 3073 ms (A) và 3124 ms (B). Khung hình rơi vào lỗ hổng này bị loại về sau bằng điều kiện đồng bộ, nên không cần dừng cả pipeline.
+
+**Thí nghiệm `break-gate`** (`break_gate.json`): nới `max_speed_mps` từ 70 lên 1000. Khi đó luật làm sạch không còn loại dòng tốc độ vô lý, và 6 dòng này (3 của mỗi drive) lọt vào silver. `dbt test` ra `PASS=5 WARN=1 ERROR=1`: test `in_range_silver_telemetry_speed_mps__70__0` **bắt được 6 dòng**, `gate_failed: true`. Sau khi khôi phục luật, kết quả trở lại `PASS=6 WARN=1 ERROR=0`.
+
+**Ý nghĩa của cổng chất lượng**: đây là lớp phòng thủ **độc lập** với luật làm sạch. Khi có người sửa nhầm luật (đổi cấu hình, refactor SQL), dữ liệu xấu vẫn bị chặn trước khi lan xuống gold và các mart. Test kiểm tra kết quả đầu ra chứ không tin vào logic biến đổi.
 
 ## Bước 3 · Silver frames
 
